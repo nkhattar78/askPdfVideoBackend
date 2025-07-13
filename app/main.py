@@ -90,10 +90,16 @@ class SmartQueryRequest(BaseModel):
 class VideoRequest(BaseModel):
     video_url: str
 
+class VideoRequestWithTranscript(BaseModel):
+    video_url: str
+    manual_transcript: Optional[str] = None
+    use_fallback: bool = True
+
 class VideoQueryRequest(BaseModel):
     query: str
     video_url: str
     k: int = 3
+    manual_transcript: Optional[str] = None
 
 class SmartVideoQueryRequest(BaseModel):
     query: str
@@ -166,14 +172,94 @@ Answer:"""
     response = model.generate_content(prompt)
     return response.text
 
-def get_youtube_transcript(video_url: str) -> str:
+def get_youtube_transcript(video_url: str, use_fallback: bool = True) -> str:
+    """
+    Get YouTube transcript with multiple fallback strategies for cloud deployment
+    """
     try:
         video_id = extract_video_id(video_url)
-        transcript = YouTubeTranscriptApi.get_transcript(video_id)
-        full_text = " ".join([entry['text'] for entry in transcript])
-        return full_text
+        
+        # Primary method: Direct transcript API
+        try:
+            transcript = YouTubeTranscriptApi.get_transcript(video_id)
+            full_text = " ".join([entry['text'] for entry in transcript])
+            return full_text
+        except Exception as primary_error:
+            if not use_fallback:
+                raise RuntimeError(f"Primary transcript retrieval failed: {str(primary_error)}")
+            
+            # Fallback method 1: Try with different language codes
+            try:
+                transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'en-US', 'en-GB'])
+                full_text = " ".join([entry['text'] for entry in transcript])
+                return full_text
+            except Exception as fallback1_error:
+                pass
+            
+            # Fallback method 2: Try to get any available transcript
+            try:
+                transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+                for transcript in transcript_list:
+                    try:
+                        transcript_data = transcript.fetch()
+                        full_text = " ".join([entry['text'] for entry in transcript_data])
+                        return full_text
+                    except:
+                        continue
+                raise Exception("No accessible transcripts found")
+            except Exception as fallback2_error:
+                pass
+            
+            # If all transcript methods fail, provide helpful error message
+            error_message = f"""Transcript retrieval failed for video {video_id}. 
+
+Primary Error: {str(primary_error)}
+
+This is likely due to:
+1. YouTube blocking cloud provider IPs (Azure/AWS/GCP)
+2. Video has no captions/transcripts
+3. Video is private or restricted
+4. Geographic restrictions
+
+For cloud deployment, consider:
+1. Using a proxy service
+2. Asking users to provide transcript text manually
+3. Using a third-party YouTube API service
+4. Processing videos locally before deployment"""
+
+            raise RuntimeError(error_message)
+            
     except Exception as e:
-        raise RuntimeError(f"Transcript retrieval failed: {str(e)}")
+        if "extract_video_id" in str(e):
+            raise RuntimeError(f"Invalid YouTube URL format: {video_url}")
+        raise RuntimeError(str(e))
+
+def get_youtube_transcript_with_proxy(video_url: str, proxy_url: str = None) -> str:
+    """
+    Get YouTube transcript using proxy (for cloud deployment)
+    This is a placeholder for proxy implementation
+    """
+    try:
+        video_id = extract_video_id(video_url)
+        
+        if proxy_url:
+            # Implement proxy logic here if needed
+            # This would require additional libraries like requests with proxy support
+            pass
+        
+        # For now, try the standard method
+        return get_youtube_transcript(video_url, use_fallback=True)
+    except Exception as e:
+        raise RuntimeError(f"Proxy transcript retrieval failed: {str(e)}")
+
+def handle_manual_transcript(video_url: str, manual_transcript: str) -> str:
+    """
+    Handle manually provided transcript text
+    """
+    if not manual_transcript or not manual_transcript.strip():
+        raise ValueError("Manual transcript text is required")
+    
+    return manual_transcript.strip()
 
 def extract_video_id(url: str) -> str:
     from urllib.parse import urlparse, parse_qs
@@ -335,45 +421,81 @@ async def smart_query(request: SmartQueryRequest):
 # ---- YouTube Video APIs ---- #
 
 @app.post("/upload-youtube/")
-async def upload_youtube(req: VideoRequest):
-    """Upload and process YouTube video transcript"""
+async def upload_youtube(req: VideoRequestWithTranscript):
+    """Upload and process YouTube video transcript with fallback support"""
     try:
-        transcript = get_youtube_transcript(req.video_url)
         video_id = extract_video_id(req.video_url)
+        
+        # Try to get transcript
+        if req.manual_transcript:
+            # Use manually provided transcript
+            transcript = handle_manual_transcript(req.video_url, req.manual_transcript)
+            source_method = "manual"
+        else:
+            # Try automatic transcript retrieval
+            try:
+                transcript = get_youtube_transcript(req.video_url, use_fallback=req.use_fallback)
+                source_method = "automatic"
+            except Exception as transcript_error:
+                # If automatic fails, provide helpful response
+                return {
+                    "success": False,
+                    "error": "transcript_blocked",
+                    "message": "YouTube transcript blocked by cloud provider",
+                    "details": str(transcript_error),
+                    "video_id": video_id,
+                    "video_url": req.video_url,
+                    "solutions": [
+                        "Provide manual transcript text in 'manual_transcript' field",
+                        "Use a proxy service",
+                        "Process video locally before cloud deployment",
+                        "Use alternative transcript services"
+                    ],
+                    "manual_upload_example": {
+                        "video_url": req.video_url,
+                        "manual_transcript": "Your transcript text here..."
+                    }
+                }
+        
         source_name = f"video_{video_id}.txt"
         chunks = split_text_into_chunks(transcript, pdf_path=source_name)
 
         create_embeddings_and_store_qdrant(chunks)
 
         return {
+            "success": True,
             "message": "YouTube transcript processed and embedded successfully",
             "video_id": video_id,
             "source": source_name,
             "num_chunks": len(chunks),
-            "video_url": req.video_url
+            "video_url": req.video_url,
+            "transcript_method": source_method,
+            "transcript_length": len(transcript)
         }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return {
+            "success": False,
+            "error": "processing_failed",
+            "message": "Failed to process YouTube video",
+            "details": str(e),
+            "video_url": req.video_url if hasattr(req, 'video_url') else "unknown"
+        }
 
 @app.post("/query_youtube/")
 async def query_youtube_video(request: VideoQueryRequest):
-    """Query a specific YouTube video transcript"""
+    """Query a specific YouTube video transcript with fallback support"""
     try:
-        # Get transcript and process it
-        transcript = get_youtube_transcript(request.video_url)
         video_id = extract_video_id(request.video_url)
         source_name = f"video_{video_id}.txt"
         
-        # Create chunks for context
-        chunks = split_text_into_chunks(transcript, pdf_path=source_name)
-        
-        # Use existing embedding search if video is already in database
+        # First, try to search in existing database
         try:
             results = search_specific_document(request.query, source_name, k=request.k)
             if results:
                 gemini_answer = ask_gemini(request.query, results)
                 return {
+                    "success": True,
                     "answer": gemini_answer,
                     "video_id": video_id,
                     "video_url": request.video_url,
@@ -383,21 +505,57 @@ async def query_youtube_video(request: VideoQueryRequest):
         except:
             pass
         
-        # If not in database, use direct transcript chunks
+        # If not in database, try to get transcript
+        if request.manual_transcript:
+            # Use manually provided transcript
+            transcript = handle_manual_transcript(request.video_url, request.manual_transcript)
+            source_method = "manual"
+        else:
+            # Try automatic transcript retrieval
+            try:
+                transcript = get_youtube_transcript(request.video_url, use_fallback=True)
+                source_method = "automatic"
+            except Exception as transcript_error:
+                # If automatic fails, provide helpful response
+                return {
+                    "success": False,
+                    "error": "transcript_blocked",
+                    "message": "YouTube transcript blocked and no manual transcript provided",
+                    "details": str(transcript_error),
+                    "video_id": video_id,
+                    "video_url": request.video_url,
+                    "solutions": [
+                        "Provide manual transcript in 'manual_transcript' field",
+                        "Upload video first using /upload-youtube/ with manual transcript",
+                        "Use a proxy service",
+                        "Process video locally"
+                    ]
+                }
+        
+        # Create chunks for context
+        chunks = split_text_into_chunks(transcript, pdf_path=source_name)
+        
         # Limit chunks for better performance
         relevant_chunks = chunks[:request.k] if len(chunks) > request.k else chunks
         gemini_answer = ask_gemini(request.query, relevant_chunks)
         
         return {
+            "success": True,
             "answer": gemini_answer,
             "video_id": video_id,
             "video_url": request.video_url,
-            "source": "direct_transcript",
+            "source": f"direct_transcript_{source_method}",
             "chunks_used": len(relevant_chunks)
         }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return {
+            "success": False,
+            "error": "query_failed",
+            "message": "Failed to query YouTube video",
+            "details": str(e),
+            "video_url": request.video_url if hasattr(request, 'video_url') else "unknown"
+        }
 
 @app.get("/videos/")
 async def list_available_videos():
@@ -488,5 +646,58 @@ async def get_content_summary():
         return summary
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/youtube_status/")
+async def check_youtube_api_status():
+    """Check if YouTube transcript API is accessible from current environment"""
+    test_video_id = "dQw4w9WgXcQ"  # Rick Roll - commonly available video
+    test_url = f"https://www.youtube.com/watch?v={test_video_id}"
+    
+    try:
+        # Try to get transcript for a well-known video
+        transcript = get_youtube_transcript(test_url, use_fallback=True)
+        return {
+            "status": "accessible",
+            "message": "YouTube transcript API is working",
+            "test_video": test_url,
+            "environment": "local_or_compatible",
+            "recommendations": [
+                "You can use automatic transcript retrieval",
+                "All YouTube endpoints should work normally"
+            ]
+        }
+    except Exception as e:
+        error_str = str(e)
+        
+        if "cloud provider" in error_str.lower() or "ip" in error_str.lower():
+            return {
+                "status": "blocked_cloud",
+                "message": "YouTube API blocked - Cloud provider IP detected",
+                "test_video": test_url,
+                "environment": "cloud_deployment",
+                "error_details": error_str,
+                "solutions": [
+                    "Use manual transcript upload",
+                    "Implement proxy service",
+                    "Process videos locally before deployment",
+                    "Use alternative transcript services"
+                ],
+                "workaround_endpoints": [
+                    "POST /upload-youtube/ with manual_transcript field",
+                    "POST /query_youtube/ with manual_transcript field"
+                ]
+            }
+        else:
+            return {
+                "status": "error_other",
+                "message": "YouTube API error - Not cloud-related",
+                "test_video": test_url,
+                "error_details": error_str,
+                "recommendations": [
+                    "Check internet connectivity",
+                    "Verify video accessibility",
+                    "Check for API rate limits"
+                ]
+            }
 
 
